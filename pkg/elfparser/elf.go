@@ -493,7 +493,7 @@ func (e *elfLoader) parseAndApplyRelocSection(progIndex uint32, loadedMaps map[s
 			Imm:    int32(binary.LittleEndian.Uint32(data[relocationEntry.relOffset+4:])),
 		}
 
-		log.Infof("BPF Instruction code: %s; offset: %d; imm: %d", ebpfInstruction.Code, ebpfInstruction.Off, ebpfInstruction.Imm)
+		log.Infof("BPF Instruction code: %d; offset: %d; imm: %d", ebpfInstruction.Code, ebpfInstruction.Off, ebpfInstruction.Imm)
 
 		//Validate for Invalid BPF instructions
 		if ebpfInstruction.Code != (unix.BPF_LD | unix.BPF_IMM | unix.BPF_DW) {
