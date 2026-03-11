@@ -213,12 +213,9 @@ func (m *BpfProgram) LoadProg(progMetaData CreateEBPFProgInput) (int, error) {
 		prog_type = uint32(netlink.BPF_PROG_TYPE_UNSPEC)
 	}
 
-	logBuf := make([]byte, utils.GetLogBufferSize())
+	// First attempt without verifier log to minimize attr size
 	program := netlink.BPFAttr{
 		ProgType: prog_type,
-		LogBuf:   uintptr(unsafe.Pointer(&logBuf[0])),
-		LogSize:  uint32(cap(logBuf) - 1),
-		LogLevel: 1,
 	}
 
 	program.Insns = uintptr(unsafe.Pointer(&progMetaData.ProgData[0]))
@@ -234,11 +231,31 @@ func (m *BpfProgram) LoadProg(progMetaData CreateEBPFProgInput) (int, error) {
 	runtime.KeepAlive(progMetaData.ProgData)
 	runtime.KeepAlive(license)
 
-	log.Infof("Load prog done with fd : %d", int(fd))
+	log.Infof("Load prog done with fd : %d errno: %d (%s) insnCnt: %d attrSize: %d progType: %d", int(fd), int(errno), errno.Error(), program.InsnCnt, unsafe.Sizeof(program), program.ProgType)
 	if errno != 0 {
-		logArray := parseLogs(logBuf)
-		for _, str := range logArray {
-			fmt.Println(str)
+		// Retry with verifier log for diagnostics
+		logBuf := make([]byte, 65535)
+		program.LogBuf = uintptr(unsafe.Pointer(&logBuf[0]))
+		program.LogSize = uint32(cap(logBuf) - 1)
+		program.LogLevel = 1
+		fd2, _, errno2 := unix.Syscall(unix.SYS_BPF,
+			uintptr(constdef.BPF_PROG_LOAD),
+			uintptr(unsafe.Pointer(&program)),
+			unsafe.Sizeof(program))
+		runtime.KeepAlive(progMetaData.ProgData)
+		runtime.KeepAlive(license)
+		runtime.KeepAlive(logBuf)
+		log.Infof("Retry load with verifier log: fd=%d errno=%d (%s)", int(fd2), int(errno2), errno2.Error())
+		if errno2 != 0 {
+			verifierLog := string(logBuf[:])
+			if idx := strings.IndexByte(verifierLog, 0); idx >= 0 {
+				verifierLog = verifierLog[:idx]
+			}
+			if len(verifierLog) > 0 {
+				log.Infof("Verifier log: %s", verifierLog)
+			}
+		} else {
+			unix.Close(int(fd2))
 		}
 		return -1, errno
 	}

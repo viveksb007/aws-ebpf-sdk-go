@@ -96,6 +96,10 @@ type elfLoader struct {
 
 	reloSectionMap map[uint32]*elf.Section
 	progSectionMap map[uint32]progEntry
+
+	// Support for BPF subprograms (__noinline static functions)
+	textSectionIndex int
+	textSection      *elf.Section
 }
 
 func New() BpfSDKClient {
@@ -126,6 +130,7 @@ func newElfLoader(elfFile *elf.File, bpfmapapi ebpf_maps.BpfMapAPIs, bpfprogapi 
 		customizedPinPath: customizedpinPath,
 		reloSectionMap:    make(map[uint32]*elf.Section),
 		progSectionMap:    make(map[uint32]progEntry),
+		textSectionIndex:  -1,
 	}
 	return elfloader
 }
@@ -287,9 +292,11 @@ func (e *elfLoader) loadProg(loadedProgData map[string]ebpf_progs.CreateEBPFProg
 
 	for _, pgmInput := range loadedProgData {
 		bpfData := BpfData{}
+		log.Infof("Attempting to load prog: type=%s insnCnt=%d dataLen=%d insDefSize=%d",
+			pgmInput.ProgType, len(pgmInput.ProgData)/pgmInput.InsDefSize, len(pgmInput.ProgData), pgmInput.InsDefSize)
 		progFD, errno := e.bpfProgApi.LoadProg(pgmInput)
 		if progFD == -1 {
-			log.Infof("Failed to load prog", "error", errno)
+			log.Infof("Failed to load prog: fd=%d err=%v", progFD, errno)
 			return nil, fmt.Errorf("failed to Load the prog")
 		}
 		log.Infof("loaded prog with %d", progFD)
@@ -358,6 +365,10 @@ func (e *elfLoader) parseSection() error {
 			log.Infof("Found maps Section at Index %v", index)
 			e.mapSection = section
 			e.mapSectionIndex = index
+		} else if section.Type == elf.SHT_PROGBITS && section.Name == ".text" {
+			log.Infof("Found .text section (BPF subprograms) at index %d", index)
+			e.textSection = section
+			e.textSectionIndex = index
 		} else if section.Type == elf.SHT_PROGBITS {
 			log.Infof("Found PROG Section at Index %v and Name %s", index, section.Name)
 			splitProgType := strings.Split(section.Name, "/")
@@ -459,16 +470,94 @@ func (e *elfLoader) parseMap(customData BpfCustomData) ([]ebpf_maps.CreateEBPFMa
 	return parsedMapData, nil
 }
 
-func (e *elfLoader) parseAndApplyRelocSection(progIndex uint32, loadedMaps map[string]ebpf_maps.BpfMap) ([]byte, map[int]string, error) {
+func (e *elfLoader) getRelocatedTextSection(loadedMaps map[string]ebpf_maps.BpfMap) ([]byte, error) {
+	if e.textSection == nil {
+		return nil, nil
+	}
+
+	data, err := e.textSection.Data()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read .text section: %v", err)
+	}
+	log.Infof("Read .text section: %d bytes (%d insns)", len(data), len(data)/bpfInsDefSize)
+
+	// Apply map relocations from .rel.text
+	reloSection := e.reloSectionMap[uint32(e.textSectionIndex)]
+	if reloSection == nil {
+		log.Infof("No .rel.text relocation section found")
+		return data, nil
+	}
+
+	relocationEntries, err := e.parseRelocationSection(reloSection, e.elfFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse .rel.text: %v", err)
+	}
+
+	for _, relEntry := range relocationEntries {
+		if relEntry.relOffset >= len(data) {
+			return nil, fmt.Errorf("invalid .text relocation offset %d (data len %d)", relEntry.relOffset, len(data))
+		}
+
+		insnCode := data[relEntry.relOffset]
+
+		// Skip BPF_CALL relocations within .text (internal function calls)
+		if insnCode == 0x85 {
+			log.Infof(".text: skipping BPF_CALL relocation for %s at offset %d", relEntry.symbol.Name, relEntry.relOffset)
+			continue
+		}
+
+		// Must be a map relocation
+		if insnCode != (unix.BPF_LD | unix.BPF_IMM | unix.BPF_DW) {
+			return nil, fmt.Errorf("invalid .text BPF instruction at %d: 0x%x", relEntry.relOffset, insnCode)
+		}
+
+		mapName := relEntry.symbol.Name
+		var mapFD int
+		if progMap, ok := loadedMaps[mapName]; ok {
+			mapFD = int(progMap.MapFD)
+		} else if globalMapFd, ok := sdkCache.Get(mapName); ok {
+			mapFD = globalMapFd
+		} else {
+			return nil, fmt.Errorf("map '%s' not found for .text relocation", mapName)
+		}
+
+		log.Infof(".text: applying map relocation for %s (FD=%d) at offset %d", mapName, mapFD, relEntry.relOffset)
+		ebpfInsn := &utils.BPFInsn{
+			Code:   data[relEntry.relOffset],
+			DstReg: data[relEntry.relOffset+1] & 0xf,
+			SrcReg: 1,
+			Off:    int16(binary.LittleEndian.Uint16(data[relEntry.relOffset+2:])),
+			Imm:    int32(mapFD),
+		}
+		copy(data[relEntry.relOffset:relEntry.relOffset+8], ebpfInsn.ConvertBPFInstructionToByteStream())
+	}
+
+	return data, nil
+}
+
+func (e *elfLoader) parseAndApplyRelocSection(progIndex uint32, loadedMaps map[string]ebpf_maps.BpfMap, textData []byte) ([]byte, map[int]string, error) {
 	progEntry := e.progSectionMap[progIndex]
 	reloSection := e.reloSectionMap[progIndex]
 
-	data, err := progEntry.progSection.Data()
+	progData, err := progEntry.progSection.Data()
 	if err != nil {
 		return nil, nil, err
 	}
+	progSectionSize := len(progData)
 	log.Infof("Loading Program with relocation section; Info:%v; Name: %s, Type: %s; Size: %v", reloSection.Info,
 		reloSection.Name, reloSection.Type, reloSection.Size)
+
+	// Append .text section (subprograms) after program section data
+	var data []byte
+	if len(textData) > 0 {
+		data = make([]byte, len(progData)+len(textData))
+		copy(data, progData)
+		copy(data[len(progData):], textData)
+		log.Infof("Appended .text section: progSize=%d textSize=%d totalSize=%d",
+			progSectionSize, len(textData), len(data))
+	} else {
+		data = progData
+	}
 
 	relocationEntries, err := e.parseRelocationSection(reloSection, e.elfFile)
 	if err != nil || len(relocationEntries) == 0 {
@@ -495,6 +584,23 @@ func (e *elfLoader) parseAndApplyRelocSection(progIndex uint32, loadedMaps map[s
 
 		log.Infof("BPF Instruction code: %d; offset: %d; imm: %d", ebpfInstruction.Code, ebpfInstruction.Off, ebpfInstruction.Imm)
 
+		// Handle BPF-to-BPF function call relocations (for __noinline subprograms)
+		if ebpfInstruction.Code == 0x85 { // BPF_JMP | BPF_CALL
+			funcName := relocationEntry.symbol.Name
+			// Set BPF_PSEUDO_CALL and compute relative offset to target function
+			// symbol.Value is the offset within .text section; after appending,
+			// the target is at progSectionSize + symbol.Value in the combined data
+			ebpfInstruction.SrcReg = 1 // BPF_PSEUDO_CALL
+			targetOffset := int32(progSectionSize) + int32(relocationEntry.symbol.Value)
+			targetInsnIdx := targetOffset / int32(bpfInsDefSize)
+			callInsnIdx := int32(relocationEntry.relOffset / bpfInsDefSize)
+			ebpfInstruction.Imm = targetInsnIdx - callInsnIdx - 1
+			log.Infof("Function call relocation: %s -> targetInsn=%d callInsn=%d relImm=%d progSecSize=%d symVal=%d",
+				funcName, targetInsnIdx, callInsnIdx, ebpfInstruction.Imm, progSectionSize, relocationEntry.symbol.Value)
+			copy(data[relocationEntry.relOffset:relocationEntry.relOffset+8], ebpfInstruction.ConvertBPFInstructionToByteStream())
+			continue
+		}
+
 		//Validate for Invalid BPF instructions
 		if ebpfInstruction.Code != (unix.BPF_LD | unix.BPF_IMM | unix.BPF_DW) {
 			return nil, nil, fmt.Errorf("invalid BPF instruction (at %d): %d",
@@ -503,8 +609,6 @@ func (e *elfLoader) parseAndApplyRelocSection(progIndex uint32, loadedMaps map[s
 
 		// Point BPF instruction to the FD of the map referenced. Update the last 4 bytes of
 		// instruction (immediate constant) with the map's FD.
-		// BPF_MEM | <size> | BPF_STX:  *(size *) (dst_reg + off) = src_reg
-		// BPF_MEM | <size> | BPF_ST:   *(size *) (dst_reg + off) = imm32
 		mapName := relocationEntry.symbol.Name
 		log.Infof("Map to be relocated; Name: %s", mapName)
 		var mapFD int
@@ -543,6 +647,15 @@ func (e *elfLoader) parseProg(loadedMaps map[string]ebpf_maps.BpfMap) (map[strin
 	//Get prog data
 	var pgmList = make(map[string]ebpf_progs.CreateEBPFProgInput)
 
+	// Pre-process .text section (BPF subprograms) with map relocations applied
+	textData, err := e.getRelocatedTextSection(loadedMaps)
+	if err != nil {
+		return nil, fmt.Errorf("failed to process .text section: %v", err)
+	}
+	if len(textData) > 0 {
+		log.Infof("Prepared .text section: %d bytes (%d insns)", len(textData), len(textData)/bpfInsDefSize)
+	}
+
 	for progIndex, progEntry := range e.progSectionMap {
 		dataProg := progEntry.progSection
 		data, err := progEntry.progSection.Data()
@@ -560,7 +673,7 @@ func (e *elfLoader) parseProg(loadedMaps map[string]ebpf_maps.BpfMap) (map[strin
 		if e.reloSectionMap[progIndex] == nil {
 			log.Infof("Relocation is not needed")
 		} else {
-			progData, associatedMaps, err := e.parseAndApplyRelocSection(progIndex, loadedMaps)
+			progData, associatedMaps, err := e.parseAndApplyRelocSection(progIndex, loadedMaps, textData)
 			if err != nil {
 				return nil, fmt.Errorf("failed to apply relocation: %v", err)
 			}
@@ -596,9 +709,14 @@ func (e *elfLoader) parseProg(loadedMaps map[string]ebpf_maps.BpfMap) (map[strin
 					if symbol.Value >= dataProg.Addr && symbol.Value < dataProg.Addr+dataProg.Size {
 
 						dataStart := (symbol.Value - dataProg.Addr)
-						dataEnd := dataStart + progSize
-						programData := make([]byte, progSize)
-						copy(programData, data[dataStart:dataEnd])
+						// Use the full combined data (prog section + .text subprograms)
+						// starting from the program's entry point
+						totalDataLen := uint64(len(data))
+						loadSize := totalDataLen - dataStart
+						log.Infof("Program '%s': funcSize=%d totalDataLen=%d loadSize=%d insns=%d",
+							ProgName, progSize, totalDataLen, loadSize, loadSize/uint64(bpfInsDefSize))
+						programData := make([]byte, loadSize)
+						copy(programData, data[dataStart:dataStart+loadSize])
 
 						pinLocation := ProgName
 						if len(e.customizedPinPath) != 0 {
