@@ -587,16 +587,19 @@ func (e *elfLoader) parseAndApplyRelocSection(progIndex uint32, loadedMaps map[s
 		// Handle BPF-to-BPF function call relocations (for __noinline subprograms)
 		if ebpfInstruction.Code == 0x85 { // BPF_JMP | BPF_CALL
 			funcName := relocationEntry.symbol.Name
-			// Set BPF_PSEUDO_CALL and compute relative offset to target function
-			// symbol.Value is the offset within .text section; after appending,
-			// the target is at progSectionSize + symbol.Value in the combined data
+			// R_BPF_64_32 formula: relocated_imm = (S + A) / 8 - 1
+			// where S = symbol.Value, A = target byte offset within the section.
+			// Clang pre-computes this and stores the result in insn.imm.
+			// Recover the target byte offset: A = (insn.imm + 1) * bpfInsDefSize
+			// Then the target in combined data is at: progSectionSize + S + A
 			ebpfInstruction.SrcReg = 1 // BPF_PSEUDO_CALL
-			targetOffset := int32(progSectionSize) + int32(relocationEntry.symbol.Value)
+			targetByteOffset := (ebpfInstruction.Imm + 1) * int32(bpfInsDefSize)
+			targetOffset := int32(progSectionSize) + int32(relocationEntry.symbol.Value) + targetByteOffset
 			targetInsnIdx := targetOffset / int32(bpfInsDefSize)
 			callInsnIdx := int32(relocationEntry.relOffset / bpfInsDefSize)
 			ebpfInstruction.Imm = targetInsnIdx - callInsnIdx - 1
-			log.Infof("Function call relocation: %s -> targetInsn=%d callInsn=%d relImm=%d progSecSize=%d symVal=%d",
-				funcName, targetInsnIdx, callInsnIdx, ebpfInstruction.Imm, progSectionSize, relocationEntry.symbol.Value)
+			log.Infof("Function call relocation: %s -> targetInsn=%d callInsn=%d relImm=%d progSecSize=%d symVal=%d addend=%d",
+				funcName, targetInsnIdx, callInsnIdx, ebpfInstruction.Imm, progSectionSize, relocationEntry.symbol.Value, targetByteOffset)
 			copy(data[relocationEntry.relOffset:relocationEntry.relOffset+8], ebpfInstruction.ConvertBPFInstructionToByteStream())
 			continue
 		}

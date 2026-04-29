@@ -25,6 +25,7 @@ import (
 	"testing"
 
 	ebpf_maps "github.com/aws/aws-ebpf-sdk-go/pkg/maps"
+	ebpf_progs "github.com/aws/aws-ebpf-sdk-go/pkg/progs"
 
 	constdef "github.com/aws/aws-ebpf-sdk-go/pkg/constants"
 	mock_ebpf_maps "github.com/aws/aws-ebpf-sdk-go/pkg/maps/mocks"
@@ -967,42 +968,191 @@ func TestChainedSubprogramParseProg(t *testing.T) {
 			"Program data should be tc_cls section + .text section")
 
 		// Verify the BPF_CALL from tc_cls to lookup_conntrack has correct relocation.
-		// The call instruction is at the start of tc_cls (offset 0).
-		// After appending .text, lookup_conntrack is at insn index (tcProgSize/bpfInsDefSize).
-		// BPF call Imm = target_insn_idx - call_insn_idx - 1
-		callInsnOffset := 0
-		callInsn := progInput.ProgData[callInsnOffset]
-		assert.Equal(t, uint8(0x85), callInsn, "First insn should be BPF_CALL")
-
-		// src_reg should be BPF_PSEUDO_CALL (1)
-		srcReg := progInput.ProgData[callInsnOffset+1] >> 4
-		assert.Equal(t, uint8(1), srcReg, "BPF_CALL should have BPF_PSEUDO_CALL src_reg")
+		// Scan for the BPF_CALL instruction in the tc_cls section rather than
+		// assuming a fixed offset, since clang may reorder instructions.
+		callInsnOffset := -1
+		for off := 0; off < tcProgSize; off += bpfInsDefSize {
+			if progInput.ProgData[off] == 0x85 && progInput.ProgData[off+1]>>4 == 1 {
+				callInsnOffset = off
+				break
+			}
+		}
+		assert.NotEqual(t, -1, callInsnOffset, "tc_cls should contain a BPF_PSEUDO_CALL instruction")
 
 		tcInsnCount := tcProgSize / bpfInsDefSize
 		lookupOffset := textFuncs["lookup_conntrack"].Value
 		expectedTargetInsn := tcInsnCount + int(lookupOffset)/bpfInsDefSize
-		expectedImm := int32(expectedTargetInsn - 0 - 1)
+		expectedImm := int32(expectedTargetInsn - callInsnOffset/bpfInsDefSize - 1)
 		actualImm := int32(binary.LittleEndian.Uint32(progInput.ProgData[callInsnOffset+4 : callInsnOffset+8]))
 		assert.Equal(t, expectedImm, actualImm,
 			"BPF_CALL Imm should point to lookup_conntrack in appended .text")
 
 		// Verify .text-internal call: lookup_conntrack -> do_lookup
-		// Clang resolves this at compile time. The call insn is at the start of
-		// lookup_conntrack within .text. After appending, it's at offset tcProgSize+0.
-		chainCallOffset := tcProgSize + int(lookupOffset)
-		chainCallInsn := progInput.ProgData[chainCallOffset]
-		assert.Equal(t, uint8(0x85), chainCallInsn, "lookup_conntrack first insn should be BPF_CALL")
-
-		chainSrcReg := progInput.ProgData[chainCallOffset+1] >> 4
-		assert.Equal(t, uint8(1), chainSrcReg, "Chained call should have BPF_PSEUDO_CALL src_reg")
+		// Scan for the BPF_PSEUDO_CALL within lookup_conntrack's range in the combined data.
+		lookupStart := tcProgSize + int(lookupOffset)
+		lookupEnd := tcProgSize + textSize
+		chainCallOffset := -1
+		for off := lookupStart; off < lookupEnd; off += bpfInsDefSize {
+			if progInput.ProgData[off] == 0x85 && progInput.ProgData[off+1]>>4 == 1 {
+				chainCallOffset = off
+				break
+			}
+		}
+		assert.NotEqual(t, -1, chainCallOffset, "lookup_conntrack should contain a BPF_PSEUDO_CALL to do_lookup")
 
 		// The Imm for the .text-internal call should be the relative offset to do_lookup
 		doLookupOffset := textFuncs["do_lookup"].Value
-		chainCallInsnIdx := int(lookupOffset) / bpfInsDefSize
+		chainCallInsnIdx := (chainCallOffset - tcProgSize) / bpfInsDefSize
 		doLookupInsnIdx := int(doLookupOffset) / bpfInsDefSize
 		expectedChainImm := int32(doLookupInsnIdx - chainCallInsnIdx - 1)
 		actualChainImm := int32(binary.LittleEndian.Uint32(progInput.ProgData[chainCallOffset+4 : chainCallOffset+8]))
 		assert.Equal(t, expectedChainImm, actualChainImm,
 			"Chained BPF_CALL Imm should point from lookup_conntrack to do_lookup within .text")
 	}
+}
+
+// TestMultiSubprogramParseProg tests an ELF with two program sections (tc_cls, xdp),
+// each calling a different subprogram in .text that references a different map.
+func TestMultiSubprogramParseProg(t *testing.T) {
+	m := setup(t, "../../test-data/tc.multi_subprog.bpf.elf")
+	defer m.ctrl.Finish()
+	f, _ := os.Open(m.path)
+	defer f.Close()
+
+	elfFile, err := elf.NewFile(f)
+	assert.NoError(t, err)
+	elfLoader := newElfLoader(elfFile, m.ebpf_maps, m.ebpf_progs, "test")
+
+	err = elfLoader.parseSection()
+	assert.NoError(t, err)
+
+	assert.NotNil(t, elfLoader.textSection)
+	assert.NotEqual(t, -1, elfLoader.textSectionIndex)
+	assert.NotNil(t, elfLoader.reloSectionMap[uint32(elfLoader.textSectionIndex)])
+
+	// Should have two prog sections (tc_cls and xdp)
+	assert.Equal(t, 2, len(elfLoader.progSectionMap))
+
+	// Parse maps — expect map_alpha and map_beta
+	mapData, err := elfLoader.parseMap(BpfCustomData{})
+	assert.NoError(t, err)
+	assert.Equal(t, 2, len(mapData))
+
+	// Return different FDs per map so we can verify correct patching
+	const alphaFD, betaFD = 5, 9
+	m.ebpf_maps.EXPECT().CreateBPFMap(gomock.Any()).DoAndReturn(
+		func(input ebpf_maps.CreateEBPFMapInput) (ebpf_maps.BpfMap, error) {
+			switch input.Name {
+			case "map_alpha":
+				return ebpf_maps.BpfMap{MapFD: alphaFD}, nil
+			case "map_beta":
+				return ebpf_maps.BpfMap{MapFD: betaFD}, nil
+			default:
+				return ebpf_maps.BpfMap{}, fmt.Errorf("unexpected map %s", input.Name)
+			}
+		}).AnyTimes()
+	m.ebpf_maps.EXPECT().GetBPFmapInfo(gomock.Any()).Return(ebpf_maps.BpfMapInfo{Id: 100}, nil).AnyTimes()
+	m.ebpf_maps.EXPECT().PinMap(gomock.Any(), gomock.Any()).AnyTimes()
+	m.ebpf_maps.EXPECT().GetMapFromPinPath(gomock.Any()).AnyTimes()
+
+	loadedMaps, err := elfLoader.loadMap(mapData)
+	assert.NoError(t, err)
+	assert.Equal(t, 2, len(loadedMaps))
+	assert.Equal(t, uint32(alphaFD), loadedMaps["map_alpha"].MapFD)
+	assert.Equal(t, uint32(betaFD), loadedMaps["map_beta"].MapFD)
+
+	// Collect .text symbol info for assertions
+	symbols, err := elfFile.Symbols()
+	assert.NoError(t, err)
+	textFuncs := map[string]elf.Symbol{}
+	for _, sym := range symbols {
+		if int(sym.Section) == elfLoader.textSectionIndex && elf.ST_TYPE(sym.Info) == elf.STT_FUNC {
+			textFuncs[sym.Name] = sym
+		}
+	}
+	assert.Contains(t, textFuncs, "lookup_alpha")
+	assert.Contains(t, textFuncs, "lookup_beta")
+
+	textData, err := elfLoader.textSection.Data()
+	assert.NoError(t, err)
+	textSize := len(textData)
+
+	// Parse progs
+	parsedProgData, err := elfLoader.parseProg(loadedMaps)
+	assert.NoError(t, err)
+	assert.Equal(t, 2, len(parsedProgData))
+
+	// Collect parsed programs by type for deterministic assertions
+	progByType := map[string]ebpf_progs.CreateEBPFProgInput{}
+	for _, p := range parsedProgData {
+		progByType[p.ProgType] = p
+	}
+	assert.Contains(t, progByType, "tc_cls")
+	assert.Contains(t, progByType, "xdp")
+
+	// Both programs should have .text appended
+	for progType, progInput := range progByType {
+		var rawSecSize int
+		for _, entry := range elfLoader.progSectionMap {
+			if entry.progType == progType {
+				d, _ := entry.progSection.Data()
+				rawSecSize = len(d)
+				break
+			}
+		}
+		assert.Equal(t, rawSecSize+textSize, len(progInput.ProgData),
+			"%s: program data should be section + .text", progType)
+	}
+
+	// --- Verify tc_cls calls lookup_alpha (at .text offset 0) ---
+	tcProg := progByType["tc_cls"]
+	var tcSecSize int
+	for _, entry := range elfLoader.progSectionMap {
+		if entry.progType == "tc_cls" {
+			d, _ := entry.progSection.Data()
+			tcSecSize = len(d)
+			break
+		}
+	}
+	// BPF_CALL is at offset 0 of tc_cls
+	assert.Equal(t, uint8(0x85), tcProg.ProgData[0], "tc_cls first insn should be BPF_CALL")
+	assert.Equal(t, uint8(1), tcProg.ProgData[1]>>4, "tc_cls BPF_CALL should have BPF_PSEUDO_CALL")
+
+	alphaOffset := textFuncs["lookup_alpha"].Value
+	tcTargetInsn := tcSecSize/bpfInsDefSize + int(alphaOffset)/bpfInsDefSize
+	tcExpectedImm := int32(tcTargetInsn - 0 - 1)
+	tcActualImm := int32(binary.LittleEndian.Uint32(tcProg.ProgData[4:8]))
+	assert.Equal(t, tcExpectedImm, tcActualImm,
+		"tc_cls BPF_CALL should target lookup_alpha")
+
+	// --- Verify xdp calls lookup_beta (at .text offset 0x60) ---
+	xdpProg := progByType["xdp"]
+	var xdpSecSize int
+	for _, entry := range elfLoader.progSectionMap {
+		if entry.progType == "xdp" {
+			d, _ := entry.progSection.Data()
+			xdpSecSize = len(d)
+			break
+		}
+	}
+	assert.Equal(t, uint8(0x85), xdpProg.ProgData[0], "xdp first insn should be BPF_CALL")
+	assert.Equal(t, uint8(1), xdpProg.ProgData[1]>>4, "xdp BPF_CALL should have BPF_PSEUDO_CALL")
+
+	betaOffset := textFuncs["lookup_beta"].Value
+	xdpTargetInsn := xdpSecSize/bpfInsDefSize + int(betaOffset)/bpfInsDefSize
+	xdpExpectedImm := int32(xdpTargetInsn - 0 - 1)
+	xdpActualImm := int32(binary.LittleEndian.Uint32(xdpProg.ProgData[4:8]))
+	assert.Equal(t, xdpExpectedImm, xdpActualImm,
+		"xdp BPF_CALL should target lookup_beta, not lookup_alpha")
+
+	// --- Verify map FDs in the .text region of each program ---
+	// lookup_alpha's map relocation is at .text offset 0x20
+	// lookup_beta's map relocation is at .text offset 0x80
+	alphaMapReloOffset := tcSecSize + 0x20
+	alphaMapFD := int32(binary.LittleEndian.Uint32(tcProg.ProgData[alphaMapReloOffset+4 : alphaMapReloOffset+8]))
+	assert.Equal(t, int32(alphaFD), alphaMapFD, "map_alpha FD should be patched in .text")
+
+	betaMapReloOffset := xdpSecSize + 0x80
+	betaMapFD := int32(binary.LittleEndian.Uint32(xdpProg.ProgData[betaMapReloOffset+4 : betaMapReloOffset+8]))
+	assert.Equal(t, int32(betaFD), betaMapFD, "map_beta FD should be patched in .text")
 }

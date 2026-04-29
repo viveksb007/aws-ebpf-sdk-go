@@ -187,12 +187,6 @@ func (m *BpfProgram) UnPinProg(pinPath string) error {
 	return unix.Close(int(m.ProgFD))
 }
 
-func parseLogs(log []byte) []string {
-	logStr := string(log)
-	logs := strings.Split(logStr, "\n")
-	return logs
-}
-
 func (m *BpfProgram) LoadProg(progMetaData CreateEBPFProgInput) (int, error) {
 
 	var prog_type uint32

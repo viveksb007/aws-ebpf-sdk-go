@@ -50,7 +50,8 @@ TARGETS := \
 		  $(TESTDATADIR)/xdp \
 		  $(TESTDATADIR)/ring_buffer \
 		  $(TESTDATADIR)/tc.subprog \
-		  $(TESTDATADIR)/tc.subprog_chain
+		  $(TESTDATADIR)/tc.subprog_chain \
+		  $(TESTDATADIR)/tc.multi_subprog
 
 %.bpf.elf: %.bpf.c
 	$(CLANG) $(CLANG_INCLUDE) $(BPF_CFLAGS) -c $< -o $@
